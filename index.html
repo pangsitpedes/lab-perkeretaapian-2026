@@ -140,9 +140,20 @@
   .btn-row{display:flex;gap:10px;}
   .btn-row .btn{flex:1;}
 
+  .reader-wrap{
+    position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);margin:14px 0;background:#000;
+  }
   #reader-pinjam,#reader-kembalikan,#reader-rusak{
-    border-radius:12px;overflow:hidden;border:1px solid var(--line);margin:14px 0;background:#000;
-    display:block;object-fit:cover;
+    display:block;width:100%;object-fit:cover;
+  }
+  .scan-overlay{
+    position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+    background:rgba(0,0,0,.55);color:#fff;font-size:13px;font-weight:600;
+  }
+  .scan-overlay.show{display:flex;}
+  .scan-overlay .spinner{
+    width:26px;height:26px;border-radius:50%;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;
+    animation:spin .7s linear infinite;
   }
 
   .scan-list{margin-top:14px;}
@@ -261,7 +272,13 @@
       <input type="text" id="input-keterangan-pinjam" placeholder="Misal: untuk praktikum Kimia Dasar">
 
       <button class="btn btn-primary" id="btn-start-scan-pinjam">Mulai Scan QR</button>
-      <video id="reader-pinjam" style="display:none;width:100%;" playsinline muted></video>
+      <div class="reader-wrap" id="reader-wrap-pinjam" style="display:none;">
+        <video id="reader-pinjam" style="width:100%;" playsinline muted></video>
+        <div class="scan-overlay" id="scan-overlay-pinjam">
+          <div class="spinner"></div>
+          <div>Memeriksa QR&hellip;</div>
+        </div>
+      </div>
       <button class="btn btn-outline" id="btn-stop-scan-pinjam" style="display:none;margin-top:10px;">Hentikan Kamera</button>
 
       <div class="scan-list" id="scan-list-pinjam"></div>
@@ -280,7 +297,13 @@
       </div>
 
       <button class="btn btn-teal" id="btn-start-scan-kembalikan">Mulai Scan QR</button>
-      <video id="reader-kembalikan" style="display:none;width:100%;" playsinline muted></video>
+      <div class="reader-wrap" id="reader-wrap-kembalikan" style="display:none;">
+        <video id="reader-kembalikan" style="width:100%;" playsinline muted></video>
+        <div class="scan-overlay" id="scan-overlay-kembalikan">
+          <div class="spinner"></div>
+          <div>Memeriksa QR&hellip;</div>
+        </div>
+      </div>
       <button class="btn btn-outline" id="btn-stop-scan-kembalikan" style="display:none;margin-top:10px;">Hentikan Kamera</button>
 
       <div class="scan-list" id="scan-list-kembalikan"></div>
@@ -302,7 +325,13 @@
       <input type="text" id="input-keterangan-rusak" placeholder="Misal: kabel putus">
 
       <button class="btn btn-brick" id="btn-start-scan-rusak">Mulai Scan QR</button>
-      <video id="reader-rusak" style="display:none;width:100%;" playsinline muted></video>
+      <div class="reader-wrap" id="reader-wrap-rusak" style="display:none;">
+        <video id="reader-rusak" style="width:100%;" playsinline muted></video>
+        <div class="scan-overlay" id="scan-overlay-rusak">
+          <div class="spinner"></div>
+          <div>Memeriksa QR&hellip;</div>
+        </div>
+      </div>
       <button class="btn btn-outline" id="btn-stop-scan-rusak" style="display:none;margin-top:10px;">Hentikan Kamera</button>
 
       <div class="scan-list" id="scan-list-rusak"></div>
@@ -356,6 +385,7 @@ window.addEventListener('DOMContentLoaded', init);
 
 function init() {
   bindNav();
+  bindUsbScanner();
   registerServiceWorker();
 
   if (CONFIG.ACCESS_PIN) {
@@ -497,7 +527,7 @@ async function loadActiveLoans() {
 function startScanner(mode) {
   const readerId = 'reader-' + mode;
   const videoEl = document.getElementById(readerId);
-  videoEl.style.display = 'block';
+  document.getElementById('reader-wrap-' + mode).style.display = 'block';
   document.getElementById('btn-start-scan-' + mode).style.display = 'none';
   document.getElementById('btn-stop-scan-' + mode).style.display = 'block';
 
@@ -515,7 +545,7 @@ function startScanner(mode) {
 
   instance.start().catch(err => {
     toast('Tidak bisa mengakses kamera: ' + err, 'err');
-    videoEl.style.display = 'none';
+    document.getElementById('reader-wrap-' + mode).style.display = 'none';
     document.getElementById('btn-start-scan-' + mode).style.display = 'block';
     document.getElementById('btn-stop-scan-' + mode).style.display = 'none';
   });
@@ -523,13 +553,13 @@ function startScanner(mode) {
 
 function stopScanner(mode) {
   const instance = getQrInstance(mode);
-  const readerId = 'reader-' + mode;
   if (instance) {
     instance.stop();
     instance.destroy();
     setQrInstance(mode, null);
   }
-  document.getElementById(readerId).style.display = 'none';
+  document.getElementById('reader-wrap-' + mode).style.display = 'none';
+  document.getElementById('scan-overlay-' + mode).classList.remove('show');
   document.getElementById('btn-start-scan-' + mode).style.display = 'block';
   document.getElementById('btn-stop-scan-' + mode).style.display = 'none';
 }
@@ -541,16 +571,84 @@ function setQrInstance(mode, val) {
   else qrRusak = val;
 }
 
+// Bekukan tampilan kamera (frame terakhir tetap terlihat) selama proses
+// validasi ke server berjalan, supaya pengguna tidak perlu terus
+// mengarahkan kamera ke QR sampai prosesnya selesai.
+function freezeScanner(mode) {
+  const instance = getQrInstance(mode);
+  if (instance) { try { instance.pause(true); } catch (e) {} }
+  const overlay = document.getElementById('scan-overlay-' + mode);
+  if (overlay) overlay.classList.add('show');
+}
+
+function resumeScanner(mode) {
+  const overlay = document.getElementById('scan-overlay-' + mode);
+  if (overlay) overlay.classList.remove('show');
+  const instance = getQrInstance(mode);
+  if (instance) { try { instance.start(); } catch (e) {} }
+}
+
 function onScanSuccess(mode, code) {
   const now = Date.now();
   if (code === lastCode[mode] && now - lastCodeTime[mode] < 2500) return;
   lastCode[mode] = code; lastCodeTime[mode] = now;
-  if (mode === 'pinjam') handleScanPinjam(code);
-  else if (mode === 'kembalikan') handleScanKembalikan(code);
-  else handleScanRusak(code);
+  freezeScanner(mode);
+  // .finally() menjamin kamera selalu di-resume apa pun hasilnya (sukses,
+  // gagal, atau early-return karena duplikat) — tidak akan freeze permanen.
+  let pending;
+  if (mode === 'pinjam') pending = handleScanPinjam(code);
+  else if (mode === 'kembalikan') pending = handleScanKembalikan(code);
+  else pending = handleScanRusak(code);
+  Promise.resolve(pending).finally(() => resumeScanner(mode));
 }
 
 function vibrate(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
+
+// ---------------- USB / BLUETOOTH BARCODE SCANNER (keyboard-emulation) ----------------
+// Scanner USB/Bluetooth tipe "HID" mengetik hasil scan secepat kilat lalu
+// menekan Enter. Kita bedakan dari ketikan manusia lewat jeda antar
+// karakter — scanner biasanya < 50ms/karakter, manusia jauh lebih lambat.
+let usbBuffer = '';
+let usbLastTime = 0;
+const USB_SCAN_MAX_GAP_MS = 60;   // jeda maksimum antar karakter dianggap "scan"
+const USB_SCAN_MIN_LENGTH = 3;    // panjang minimum supaya tidak salah pencet Enter biasa
+
+function bindUsbScanner() {
+  document.addEventListener('keydown', (e) => {
+    // Abaikan kalau sedang mengetik manual di kolom teks (nama peminjam, dst)
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+    const now = Date.now();
+    const gap = now - usbLastTime;
+    usbLastTime = now;
+
+    if (e.key === 'Enter') {
+      const code = usbBuffer;
+      usbBuffer = '';
+      if (code.length >= USB_SCAN_MIN_LENGTH) {
+        e.preventDefault();
+        handleUsbScan(code);
+      }
+      return;
+    }
+
+    if (e.key.length === 1) {
+      // Ketikan lambat (bukan scanner) -> mulai buffer baru
+      if (gap > USB_SCAN_MAX_GAP_MS) usbBuffer = '';
+      usbBuffer += e.key;
+    }
+  });
+}
+
+function handleUsbScan(code) {
+  const activeScreen = document.querySelector('.screen.active');
+  const id = activeScreen ? activeScreen.id : '';
+  if (id === 'screen-pinjam') handleScanPinjam(code);
+  else if (id === 'screen-kembalikan') handleScanKembalikan(code);
+  else if (id === 'screen-rusak') handleScanRusak(code);
+  else toast('Buka menu Pinjam/Kembalikan/Lapor Rusak dulu sebelum scan', 'err');
+}
 
 // ---------------- PINJAM FLOW ----------------
 async function handleScanPinjam(barcode) {
