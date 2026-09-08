@@ -155,6 +155,9 @@
     width:26px;height:26px;border-radius:50%;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;
     animation:spin .7s linear infinite;
   }
+  .hint-multiqr{
+    font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.4;padding:0 2px;
+  }
 
   .scan-list{margin-top:14px;}
   .scan-item{
@@ -272,11 +275,12 @@
       <input type="text" id="input-keterangan-pinjam" placeholder="Misal: untuk praktikum Kimia Dasar">
 
       <button class="btn btn-primary" id="btn-start-scan-pinjam">Mulai Scan QR</button>
+      <div class="hint-multiqr" id="hint-multiqr-pinjam" style="display:none;">Perangkat ini bisa membaca beberapa QR sekaligus dalam satu frame — taruh beberapa alat berdampingan lalu arahkan kamera.</div>
       <div class="reader-wrap" id="reader-wrap-pinjam" style="display:none;">
         <video id="reader-pinjam" style="width:100%;" playsinline muted></video>
         <div class="scan-overlay" id="scan-overlay-pinjam">
           <div class="spinner"></div>
-          <div>Memeriksa QR&hellip;</div>
+          <div id="scan-overlay-text-pinjam">Memeriksa QR&hellip;</div>
         </div>
       </div>
       <button class="btn btn-outline" id="btn-stop-scan-pinjam" style="display:none;margin-top:10px;">Hentikan Kamera</button>
@@ -297,11 +301,12 @@
       </div>
 
       <button class="btn btn-teal" id="btn-start-scan-kembalikan">Mulai Scan QR</button>
+      <div class="hint-multiqr" id="hint-multiqr-kembalikan" style="display:none;">Perangkat ini bisa membaca beberapa QR sekaligus dalam satu frame — taruh beberapa alat berdampingan lalu arahkan kamera.</div>
       <div class="reader-wrap" id="reader-wrap-kembalikan" style="display:none;">
         <video id="reader-kembalikan" style="width:100%;" playsinline muted></video>
         <div class="scan-overlay" id="scan-overlay-kembalikan">
           <div class="spinner"></div>
-          <div>Memeriksa QR&hellip;</div>
+          <div id="scan-overlay-text-kembalikan">Memeriksa QR&hellip;</div>
         </div>
       </div>
       <button class="btn btn-outline" id="btn-stop-scan-kembalikan" style="display:none;margin-top:10px;">Hentikan Kamera</button>
@@ -325,11 +330,12 @@
       <input type="text" id="input-keterangan-rusak" placeholder="Misal: kabel putus">
 
       <button class="btn btn-brick" id="btn-start-scan-rusak">Mulai Scan QR</button>
+      <div class="hint-multiqr" id="hint-multiqr-rusak" style="display:none;">Perangkat ini bisa membaca beberapa QR sekaligus dalam satu frame — taruh beberapa alat berdampingan lalu arahkan kamera.</div>
       <div class="reader-wrap" id="reader-wrap-rusak" style="display:none;">
         <video id="reader-rusak" style="width:100%;" playsinline muted></video>
         <div class="scan-overlay" id="scan-overlay-rusak">
           <div class="spinner"></div>
-          <div>Memeriksa QR&hellip;</div>
+          <div id="scan-overlay-text-rusak">Memeriksa QR&hellip;</div>
         </div>
       </div>
       <button class="btn btn-outline" id="btn-stop-scan-rusak" style="display:none;margin-top:10px;">Hentikan Kamera</button>
@@ -379,6 +385,14 @@ let qrPinjam = null, qrKembalikan = null, qrRusak = null;
 let busyPinjam = false, busyKembalikan = false, busyRusak = false;
 let lastCode = { pinjam: '', kembalikan: '', rusak: '' };
 let lastCodeTime = { pinjam: 0, kembalikan: 0, rusak: 0 };
+let scannerFrozen = { pinjam: false, kembalikan: false, rusak: false };
+
+// Deteksi banyak QR sekaligus dalam satu frame — hanya tersedia di browser
+// dengan fitur native Barcode Detection (kebanyakan Chrome/Android). Di
+// browser lain, otomatis fallback ke scan satu-per-satu seperti biasa.
+const SUPPORTS_MULTI_QR = 'BarcodeDetector' in window;
+let multiDetector = null;
+let multiTimer = { pinjam: null, kembalikan: null, rusak: null };
 
 // ---------------- INIT ----------------
 window.addEventListener('DOMContentLoaded', init);
@@ -405,6 +419,12 @@ function startApp() {
   document.getElementById('screen-lock').style.display = 'none';
   testConnection();
   loadActiveLoans();
+  if (SUPPORTS_MULTI_QR) {
+    ['pinjam', 'kembalikan', 'rusak'].forEach(m => {
+      const el = document.getElementById('hint-multiqr-' + m);
+      if (el) el.style.display = 'block';
+    });
+  }
 }
 
 function safeStorageGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
@@ -543,7 +563,9 @@ function startScanner(mode) {
   );
   setQrInstance(mode, instance);
 
-  instance.start().catch(err => {
+  instance.start().then(() => {
+    startMultiDetectLoop(mode);
+  }).catch(err => {
     toast('Tidak bisa mengakses kamera: ' + err, 'err');
     document.getElementById('reader-wrap-' + mode).style.display = 'none';
     document.getElementById('btn-start-scan-' + mode).style.display = 'block';
@@ -552,12 +574,14 @@ function startScanner(mode) {
 }
 
 function stopScanner(mode) {
+  stopMultiDetectLoop(mode);
   const instance = getQrInstance(mode);
   if (instance) {
     instance.stop();
     instance.destroy();
     setQrInstance(mode, null);
   }
+  scannerFrozen[mode] = false;
   document.getElementById('reader-wrap-' + mode).style.display = 'none';
   document.getElementById('scan-overlay-' + mode).classList.remove('show');
   document.getElementById('btn-start-scan-' + mode).style.display = 'block';
@@ -570,18 +594,25 @@ function setQrInstance(mode, val) {
   else if (mode === 'kembalikan') qrKembalikan = val;
   else qrRusak = val;
 }
+function getStateList(mode) {
+  return mode === 'pinjam' ? state.scannedPinjam : mode === 'kembalikan' ? state.scannedKembalikan : state.scannedRusak;
+}
 
 // Bekukan tampilan kamera (frame terakhir tetap terlihat) selama proses
 // validasi ke server berjalan, supaya pengguna tidak perlu terus
 // mengarahkan kamera ke QR sampai prosesnya selesai.
-function freezeScanner(mode) {
+function freezeScanner(mode, label) {
+  scannerFrozen[mode] = true;
   const instance = getQrInstance(mode);
   if (instance) { try { instance.pause(true); } catch (e) {} }
   const overlay = document.getElementById('scan-overlay-' + mode);
+  const textEl = document.getElementById('scan-overlay-text-' + mode);
+  if (textEl) textEl.textContent = label || 'Memeriksa QR…';
   if (overlay) overlay.classList.add('show');
 }
 
 function resumeScanner(mode) {
+  scannerFrozen[mode] = false;
   const overlay = document.getElementById('scan-overlay-' + mode);
   if (overlay) overlay.classList.remove('show');
   const instance = getQrInstance(mode);
@@ -589,6 +620,7 @@ function resumeScanner(mode) {
 }
 
 function onScanSuccess(mode, code) {
+  if (scannerFrozen[mode]) return; // lagi memproses batch dari loop multi-QR
   const now = Date.now();
   if (code === lastCode[mode] && now - lastCodeTime[mode] < 2500) return;
   lastCode[mode] = code; lastCodeTime[mode] = now;
@@ -600,6 +632,84 @@ function onScanSuccess(mode, code) {
   else if (mode === 'kembalikan') pending = handleScanKembalikan(code);
   else pending = handleScanRusak(code);
   Promise.resolve(pending).finally(() => resumeScanner(mode));
+}
+
+// ---------------- MULTI-QR DETECTION (satu frame, beberapa QR sekaligus) ----------------
+// Berjalan berdampingan dengan alur scan satu-per-satu di atas. Hanya
+// bereaksi kalau BENAR-BENAR ada lebih dari satu QR baru yang terlihat
+// bersamaan dalam satu frame — kalau cuma satu, dibiarkan ditangani oleh
+// alur normal (onScanSuccess) di atas supaya tidak saling rebutan.
+function startMultiDetectLoop(mode) {
+  if (!SUPPORTS_MULTI_QR) return;
+  if (!multiDetector) {
+    try { multiDetector = new BarcodeDetector({ formats: ['qr_code'] }); }
+    catch (e) { return; }
+  }
+  const videoEl = document.getElementById('reader-' + mode);
+
+  const tick = async () => {
+    if (!getQrInstance(mode)) return; // scanner sudah dihentikan -> loop berhenti sendiri
+    if (!scannerFrozen[mode] && videoEl.readyState >= 2) {
+      try {
+        const results = await multiDetector.detect(videoEl);
+        if (results.length > 1) {
+          const list = getStateList(mode);
+          const codes = [...new Set(results.map(r => r.rawValue))].filter(v => !list.some(x => x.barcode === v));
+          if (codes.length > 1) await processBatch(mode, codes);
+        }
+      } catch (e) { /* frame belum siap / decode gagal, coba lagi di tick berikutnya */ }
+    }
+    multiTimer[mode] = setTimeout(tick, 600);
+  };
+  tick();
+}
+
+function stopMultiDetectLoop(mode) {
+  if (multiTimer[mode]) { clearTimeout(multiTimer[mode]); multiTimer[mode] = null; }
+}
+
+async function processBatch(mode, codes) {
+  freezeScanner(mode, codes.length + ' QR terdeteksi, memeriksa…');
+  try {
+    const results = await Promise.all(codes.map(code => validateForMode(mode, code)));
+    const list = getStateList(mode);
+    let added = 0;
+    const errors = [];
+    results.forEach((r, i) => {
+      if (r.ok) { list.push(r.item); added++; }
+      else errors.push(codes[i] + (r.error ? ' (' + r.error + ')' : ''));
+    });
+    if (added) { vibrate(80); renderScanList(mode); }
+    if (added && !errors.length) toast('✓ ' + added + ' alat ditambahkan sekaligus', 'ok');
+    else if (added && errors.length) toast('✓ ' + added + ' ditambahkan, ' + errors.length + ' gagal: ' + errors.join(', '), 'err');
+    else if (errors.length) toast('✗ Gagal: ' + errors.join(', '), 'err');
+  } finally {
+    resumeScanner(mode);
+  }
+}
+
+// Aturan validasi satu QR untuk mode tertentu — dipakai baik oleh alur
+// scan satu-per-satu (handleScanX) maupun alur batch (processBatch), jadi
+// aturannya (kondisi alat, dsb.) selalu konsisten di kedua alur.
+async function validateForMode(mode, barcode) {
+  try {
+    if (mode === 'kembalikan') {
+      const res = await apiGet('cekPengembalian', { barcode });
+      if (!res.ok) return { ok: false, error: res.error };
+      return { ok: true, item: res.data };
+    }
+    const res = await apiGet('cekBarcode', { barcode });
+    if (!res.ok) return { ok: false, error: res.error };
+    const alat = res.data;
+    if (alat.kondisi === 'Dipinjam') {
+      return { ok: false, error: mode === 'rusak' ? alat.nama + ' sedang dipinjam — kembalikan dulu' : alat.nama + ' sedang dipinjam' };
+    }
+    if (mode === 'pinjam' && alat.kondisi === 'Rusak') return { ok: false, error: alat.nama + ' berstatus rusak' };
+    if (mode === 'rusak') return { ok: true, item: { barcode: alat.barcode, nama: alat.nama, posisi: alat.posisi, kondisi: alat.kondisi } };
+    return { ok: true, item: { barcode: alat.barcode, nama: alat.nama, posisi: alat.posisi } };
+  } catch (e) {
+    return { ok: false, error: 'Gagal memeriksa QR' };
+  }
 }
 
 function vibrate(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
@@ -656,17 +766,12 @@ async function handleScanPinjam(barcode) {
   if (state.scannedPinjam.some(x => x.barcode === barcode)) { toast('Sudah dalam daftar: ' + barcode, 'err'); return; }
   busyPinjam = true;
   try {
-    const res = await apiGet('cekBarcode', { barcode });
-    if (!res.ok) { toast('✗ ' + res.error, 'err'); return; }
-    const alat = res.data;
-    if (alat.kondisi === 'Dipinjam') { toast(alat.nama + ' sedang dipinjam', 'err'); return; }
-    if (alat.kondisi === 'Rusak') { toast(alat.nama + ' berstatus rusak', 'err'); return; }
-    state.scannedPinjam.push({ barcode: alat.barcode, nama: alat.nama, posisi: alat.posisi });
+    const r = await validateForMode('pinjam', barcode);
+    if (!r.ok) { toast('✗ ' + r.error, 'err'); return; }
+    state.scannedPinjam.push(r.item);
     vibrate(80);
-    toast('✓ Ditambahkan: ' + alat.nama, 'ok');
+    toast('✓ Ditambahkan: ' + r.item.nama, 'ok');
     renderScanList('pinjam');
-  } catch (e) {
-    toast('Gagal memeriksa QR', 'err');
   } finally {
     busyPinjam = false;
   }
@@ -712,15 +817,12 @@ async function handleScanKembalikan(barcode) {
   if (state.scannedKembalikan.some(x => x.barcode === barcode)) { toast('Sudah dalam daftar: ' + barcode, 'err'); return; }
   busyKembalikan = true;
   try {
-    const res = await apiGet('cekPengembalian', { barcode });
-    if (!res.ok) { toast('✗ ' + res.error, 'err'); return; }
-    const loan = res.data;
-    state.scannedKembalikan.push(loan);
+    const r = await validateForMode('kembalikan', barcode);
+    if (!r.ok) { toast('✗ ' + r.error, 'err'); return; }
+    state.scannedKembalikan.push(r.item);
     vibrate(80);
-    toast('✓ ' + loan.namaAlat + ' — ' + loan.namaPeminjam, 'ok');
+    toast('✓ ' + r.item.namaAlat + ' — ' + r.item.namaPeminjam, 'ok');
     renderScanList('kembalikan');
-  } catch (e) {
-    toast('Gagal memeriksa QR', 'err');
   } finally {
     busyKembalikan = false;
   }
@@ -763,16 +865,12 @@ async function handleScanRusak(barcode) {
   if (state.scannedRusak.some(x => x.barcode === barcode)) { toast('Sudah dalam daftar: ' + barcode, 'err'); return; }
   busyRusak = true;
   try {
-    const res = await apiGet('cekBarcode', { barcode });
-    if (!res.ok) { toast('✗ ' + res.error, 'err'); return; }
-    const alat = res.data;
-    if (alat.kondisi === 'Dipinjam') { toast(alat.nama + ' sedang dipinjam — kembalikan dulu', 'err'); return; }
-    state.scannedRusak.push({ barcode: alat.barcode, nama: alat.nama, posisi: alat.posisi, kondisi: alat.kondisi });
+    const r = await validateForMode('rusak', barcode);
+    if (!r.ok) { toast('✗ ' + r.error, 'err'); return; }
+    state.scannedRusak.push(r.item);
     vibrate(80);
-    toast('✓ Ditambahkan: ' + alat.nama, 'ok');
+    toast('✓ Ditambahkan: ' + r.item.nama, 'ok');
     renderScanList('rusak');
-  } catch (e) {
-    toast('Gagal memeriksa QR', 'err');
   } finally {
     busyRusak = false;
   }
