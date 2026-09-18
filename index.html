@@ -383,8 +383,6 @@ const state = {
 
 let qrPinjam = null, qrKembalikan = null, qrRusak = null;
 let busyPinjam = false, busyKembalikan = false, busyRusak = false;
-let lastCode = { pinjam: '', kembalikan: '', rusak: '' };
-let lastCodeTime = { pinjam: 0, kembalikan: 0, rusak: 0 };
 let scannerFrozen = { pinjam: false, kembalikan: false, rusak: false };
 
 // Cache data yang di-load di latar belakang (tidak ditampilkan) supaya
@@ -411,16 +409,24 @@ async function preloadAktifCache() {
   } catch (e) { /* biarkan, nanti fallback ke network saat scan */ }
 }
 
-// Deteksi native (QR + barcode 1D) — hanya diaktifkan di HP, di sana
-// kasusnya paling relevan (taruh beberapa alat berdampingan lalu difoto),
-// dan supaya tidak bentrok dengan bug pembacaan di PC yang belum
-// diperbaiki (akan ditangani terpisah nanti).
-const IS_MOBILE_LIKE = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-  (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
-const SUPPORTS_NATIVE_DETECT = ('BarcodeDetector' in window) && IS_MOBILE_LIKE;
+// Deteksi QR/barcode dijalankan sepenuhnya oleh kode kita sendiri (bukan
+// lewat decoder bawaan library qr-scanner) di SEMUA perangkat termasuk PC —
+// supaya konsisten dan tidak bergantung pada implementasi native browser
+// yang di sebagian PC ternyata ada tapi tidak berfungsi dengan benar.
+//
+// Dua mekanisme berjalan berdampingan untuk tiap frame:
+// 1) BarcodeDetector native (kalau tersedia & berfungsi) — bisa baca QR
+//    DAN barcode 1D, serta beberapa kode sekaligus dalam satu frame.
+// 2) jsQR (dibundel offline lewat qr-scanner-worker.min.js) — QR-only,
+//    tapi selalu bekerja murni lewat algoritma (tidak tergantung browser),
+//    jadi jadi jaring pengaman kalau opsi (1) di atas gagal/tidak ada.
+const SUPPORTS_NATIVE_DETECT = 'BarcodeDetector' in window;
 const DESIRED_FORMATS = ['qr_code', 'code_128', 'code_39', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'codabar', 'itf'];
 let multiDetector = null;
 let multiTimer = { pinjam: null, kembalikan: null, rusak: null };
+let jsQrWorker = null;
+let jsQrPending = new Map();
+let jsQrMsgId = 0;
 
 // ---------------- INIT ----------------
 window.addEventListener('DOMContentLoaded', init);
@@ -449,12 +455,18 @@ function startApp() {
   loadActiveLoans();
   preloadAlatCache();
   preloadAktifCache();
-  if (SUPPORTS_NATIVE_DETECT) {
-    ['pinjam', 'kembalikan', 'rusak'].forEach(m => {
-      const el = document.getElementById('hint-multiqr-' + m);
-      if (el) el.style.display = 'block';
-    });
-  }
+  // Hint "bisa baca barcode / beberapa sekaligus" hanya ditampilkan kalau
+  // fitur native-nya benar-benar berhasil diinisialisasi di perangkat ini
+  // (bukan cuma karena API-nya "ada" — karena di sebagian PC API ini ada
+  // tapi ternyata tidak berfungsi dengan baik).
+  initMultiDetector().then(() => {
+    if (multiDetector) {
+      ['pinjam', 'kembalikan', 'rusak'].forEach(m => {
+        const el = document.getElementById('hint-multiqr-' + m);
+        if (el) el.style.display = 'block';
+      });
+    }
+  });
 }
 
 function safeStorageGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
@@ -583,7 +595,7 @@ function startScanner(mode) {
 
   const instance = new QrScanner(
     videoEl,
-    (result) => { if (!SUPPORTS_NATIVE_DETECT) onScanSuccess(mode, result.data || result); },
+    () => {}, // decode ditangani sepenuhnya oleh loop kita sendiri (lihat startMultiDetectLoop) — bukan lewat qr-scanner, supaya tidak tergantung fitur native yang di sebagian PC ternyata tidak berfungsi
     {
       preferredCamera: 'environment',
       highlightScanRegion: true,
@@ -649,28 +661,9 @@ function resumeScanner(mode) {
   if (instance) { try { instance.start(); } catch (e) {} }
 }
 
-function onScanSuccess(mode, code) {
-  if (scannerFrozen[mode]) return; // lagi memproses batch dari loop multi-QR
-  const now = Date.now();
-  if (code === lastCode[mode] && now - lastCodeTime[mode] < 2500) return;
-  lastCode[mode] = code; lastCodeTime[mode] = now;
-  freezeScanner(mode);
-  // .finally() menjamin kamera selalu di-resume apa pun hasilnya (sukses,
-  // gagal, atau early-return karena duplikat) — tidak akan freeze permanen.
-  let pending;
-  if (mode === 'pinjam') pending = handleScanPinjam(code);
-  else if (mode === 'kembalikan') pending = handleScanKembalikan(code);
-  else pending = handleScanRusak(code);
-  Promise.resolve(pending).finally(() => resumeScanner(mode));
-}
-
-// ---------------- DETEKSI NATIVE (QR + barcode, satu atau beberapa sekaligus) ----------------
-// Di HP (SUPPORTS_NATIVE_DETECT true), ini jadi jalur utama pembacaan —
-// mendukung QR maupun barcode 1D, dan bisa membaca beberapa kode sekaligus
-// dalam satu frame. Di perangkat lain (termasuk PC, untuk sementara),
-// tetap pakai qr-scanner (QR-only) seperti sebelumnya lewat onScanSuccess.
+// ---------------- DETEKSI QR/BARCODE (native + jsQR, semua perangkat) ----------------
 async function initMultiDetector() {
-  if (multiDetector || !SUPPORTS_NATIVE_DETECT) return;
+  if (multiDetector !== null || !SUPPORTS_NATIVE_DETECT) return;
   let formats = DESIRED_FORMATS;
   try {
     if (BarcodeDetector.getSupportedFormats) {
@@ -680,24 +673,72 @@ async function initMultiDetector() {
   } catch (e) { /* pakai daftar default */ }
   if (!formats.length) formats = ['qr_code'];
   try { multiDetector = new BarcodeDetector({ formats }); }
-  catch (e) { multiDetector = null; }
+  catch (e) { multiDetector = undefined; } // undefined = sudah dicoba & gagal, jangan coba lagi
+}
+
+// jsQR sebagai jaring pengaman: murni algoritma (tidak tergantung browser),
+// jadi tetap membaca QR meski fitur native di atas tidak ada/tidak berfungsi.
+// Hanya bisa baca QR (bukan barcode 1D) — itu bagian yang memang wajib
+// mengandalkan fitur native browser.
+async function getJsQrWorker() {
+  if (jsQrWorker) return jsQrWorker;
+  try {
+    const mod = await import('./qr-scanner-worker.min.js');
+    jsQrWorker = mod.createWorker();
+    jsQrWorker.onmessage = (e) => {
+      const { id, data } = e.data || {};
+      const resolve = jsQrPending.get(id);
+      if (resolve) { jsQrPending.delete(id); resolve(data || null); }
+    };
+  } catch (e) { jsQrWorker = null; }
+  return jsQrWorker;
+}
+
+function decodeFrameWithJsQr(videoEl) {
+  return new Promise(async (resolve) => {
+    if (!videoEl.videoWidth) { resolve(null); return; }
+    const worker = await getJsQrWorker();
+    if (!worker) { resolve(null); return; }
+    const canvas = document.createElement('canvas');
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    let imageData;
+    try {
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(videoEl, 0, 0);
+      imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    } catch (e) { resolve(null); return; }
+    const id = ++jsQrMsgId;
+    jsQrPending.set(id, resolve);
+    worker.postMessage({ id, type: 'decode', data: { data: imageData.data, width: canvas.width, height: canvas.height } });
+    setTimeout(() => { if (jsQrPending.has(id)) { jsQrPending.delete(id); resolve(null); } }, 1500);
+  });
 }
 
 function startMultiDetectLoop(mode) {
-  if (!SUPPORTS_NATIVE_DETECT) return;
   const videoEl = document.getElementById('reader-' + mode);
 
   const tick = async () => {
     if (!getQrInstance(mode)) return; // scanner sudah dihentikan -> loop berhenti sendiri
-    if (multiDetector && !scannerFrozen[mode] && videoEl.readyState >= 2) {
+    if (!scannerFrozen[mode] && videoEl.readyState >= 2) {
       try {
-        const results = await multiDetector.detect(videoEl);
-        if (results.length >= 1) {
-          const list = getStateList(mode);
-          const codes = [...new Set(results.map(r => r.rawValue))].filter(v => !list.some(x => x.barcode === v));
-          if (codes.length) await processBatch(mode, codes);
+        let codes = [];
+        if (multiDetector) {
+          try {
+            const results = await multiDetector.detect(videoEl);
+            codes = results.map(r => r.rawValue);
+          } catch (e) { /* deteksi native gagal untuk frame ini, lanjut ke jsQR */ }
         }
-      } catch (e) { /* frame belum siap / decode gagal, coba lagi di tick berikutnya */ }
+        if (!codes.length) {
+          const qrText = await decodeFrameWithJsQr(videoEl);
+          if (qrText) codes = [qrText];
+        }
+        if (codes.length) {
+          const list = getStateList(mode);
+          const newCodes = [...new Set(codes)].filter(v => !list.some(x => x.barcode === v));
+          if (newCodes.length) await processBatch(mode, newCodes);
+        }
+      } catch (e) { /* coba lagi di tick berikutnya */ }
     }
     multiTimer[mode] = setTimeout(tick, 400);
   };
