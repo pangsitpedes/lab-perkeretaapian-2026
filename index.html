@@ -640,13 +640,12 @@ function getStateList(mode) {
   return mode === 'pinjam' ? state.scannedPinjam : mode === 'kembalikan' ? state.scannedKembalikan : state.scannedRusak;
 }
 
-// Bekukan tampilan kamera (frame terakhir tetap terlihat) selama proses
-// validasi ke server berjalan, supaya pengguna tidak perlu terus
-// mengarahkan kamera ke QR sampai prosesnya selesai.
+// Tampilkan overlay "Memeriksa..." sambil validasi ke server berjalan.
+// Kamera TIDAK dihentikan/dipause — tetap live di belakang overlay, hanya
+// flag scannerFrozen yang mencegah loop deteksi memproses ulang selagi
+// masih menunggu hasil dari server.
 function freezeScanner(mode, label) {
   scannerFrozen[mode] = true;
-  const instance = getQrInstance(mode);
-  if (instance) { try { instance.pause(true); } catch (e) {} }
   const overlay = document.getElementById('scan-overlay-' + mode);
   const textEl = document.getElementById('scan-overlay-text-' + mode);
   if (textEl) textEl.textContent = label || 'Memeriksa QR…';
@@ -657,8 +656,6 @@ function resumeScanner(mode) {
   scannerFrozen[mode] = false;
   const overlay = document.getElementById('scan-overlay-' + mode);
   if (overlay) overlay.classList.remove('show');
-  const instance = getQrInstance(mode);
-  if (instance) { try { instance.start(); } catch (e) {} }
 }
 
 // ---------------- DETEKSI QR/BARCODE (native + jsQR, semua perangkat) ----------------
